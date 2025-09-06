@@ -3,5 +3,3 @@ pyrogram==2.0.106
 telethon==1.34.0
 python-dotenv==1.0.0
 aiohttp==3.9.1
-tqdm==4.66.1
-loguru==0.7.2
