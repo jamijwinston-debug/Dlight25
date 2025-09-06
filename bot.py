@@ -5,6 +5,7 @@ import os
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from pyrogram import Client, errors
+from telegram.helpers import escape_markdown
 
 # Configure logging
 logging.basicConfig(
@@ -15,16 +16,25 @@ logger = logging.getLogger(__name__)
 
 # --- CONFIGURATION ---
 BOT_TOKEN = os.getenv('BOT_TOKEN')
-API_ID = os.getenv('API_ID')
 API_HASH = os.getenv('API_HASH')
+SESSION_STRING = os.getenv('PYROGRAM_SESSION')
 SESSION_NAME = "dlight_scanner_bot"
+API_ID = None
+# Safely get and convert API_ID to an integer
+try:
+    API_ID_STR = os.getenv('API_ID')
+    if API_ID_STR:
+        API_ID = int(API_ID_STR)
+except (ValueError, TypeError):
+    logger.error("FATAL: API_ID environment variable is not a valid number.")
 # --- END CONFIGURATION ---
 
-pyro_client = None
+user_client = None
 
 async def extract_entity_info(link: str):
     """Extract entity username or joinchat id from link"""
-    match = re.search(r"t\.me/(?:joinchat/|\+)?([\w-]+)", link)
+    # This regex is improved to handle public channel links like t.me/channelname
+    match = re.search(r"(?:https?://)?(?:www\.)?t\.me/(?:joinchat/|\+)?([\w-]+)", link)
     if not match:
         if link.startswith('@'):
             return link
@@ -32,7 +42,7 @@ async def extract_entity_info(link: str):
     return match.group(1)
 
 async def enhanced_analyze_member(user):
-    """Enhanced member analysis with multiple checks to identify fake/suspicious accounts."""
+    """Enhanced member analysis with multiple heuristics."""
     if getattr(user, "is_bot", False) or getattr(user, "bot", False):
         return "bot"
     
@@ -51,11 +61,11 @@ async def enhanced_analyze_member(user):
         suspicious_patterns += 1
     
     if not last_name:
-        suspicious_patterns += 0.5
+        suspicious_patterns += 1
     
     if suspicious_patterns >= 3:
         return "fake"
-    elif suspicious_patterns >= 1.5:
+    elif suspicious_patterns >= 2:
         return "suspicious"
     
     return "real"
@@ -66,7 +76,10 @@ async def scan_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_input = message.text.strip()
     
     if not ("t.me/" in user_input or user_input.startswith('@')):
-        await message.reply_text("❌ Please provide a valid Telegram group/channel link or username (e.g., `https://t.me/durov` or `@durov`).")
+        await message.reply_text(
+            "❌ Please provide a valid Telegram group/channel link or username\.\n\n*Example:* `https://t\.me/durov` or `@durov`",
+            parse_mode="MarkdownV2"
+        )
         return
     
     processing_msg = await message.reply_text("🔄 Scanning members... This may take a while for large groups.")
@@ -77,9 +90,9 @@ async def scan_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     try:
-        entity = await pyro_client.get_chat(entity_id)
-        members_iterator = pyro_client.get_chat_members(entity.id, limit=200) 
-        real_count, bot_count, suspicious_count, fake_count = 0, 0, 0, 0
+        entity = await user_client.get_chat(entity_id)
+        members_iterator = user_client.get_chat_members(entity.id, limit=200) 
+        real_count = bot_count = suspicious_count = fake_count = 0
         total_members_scanned = 0
 
         async for member in members_iterator:
@@ -95,42 +108,44 @@ async def scan_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 suspicious_count += 1
         
         if total_members_scanned == 0:
-            await processing_msg.edit_text("❌ Could not retrieve any members. The bot might need to be an admin in the channel.")
+            await processing_msg.edit_text("❌ Could not retrieve any members. The bot might not have access, or the chat is empty.")
             return
 
+        member_total = getattr(entity, "members_count", "unknown")
+        # Escape the title for MarkdownV2
+        safe_title = escape_markdown(entity.title, version=2)
+
         report = (
-            f"📊 **Member Analysis Report**\n\n"
-            f"🏷 **Entity:** {entity.title}\n"
-            f"👥 **Total Members Scanned:** {total_members_scanned} (out of {entity.members_count})\n\n"
-            f"✅ **Real Users:** {real_count} ({real_count/total_members_scanned*100:.1f}%)\n"
-            f"🤖 **Bots:** {bot_count} ({bot_count/total_members_scanned*100:.1f}%)\n"
-            f"⚠️ **Suspicious Accounts:** {suspicious_count} ({suspicious_count/total_members_scanned*100:.1f}%)\n"
-            f"❌ **Fake Accounts:** {fake_count} ({fake_count/total_members_scanned*100:.1f}%)\n\n"
-            f"💡 **Note:** This analysis is a heuristic estimation. The bot scans the first 200 members for a quick analysis."
+            f"📊 *Member Analysis Report*\n\n"
+            f"🏷 *Entity:* {safe_title}\n"
+            f"👥 *Total Members Scanned:* {total_members_scanned} \(out of {member_total}\)\n\n"
+            f"✅ *Real Users:* {real_count} \({real_count/total_members_scanned*100:.1f}%\)\n"
+            f"🤖 *Bots:* {bot_count} \({bot_count/total_members_scanned*100:.1f}%\)\n"
+            f"⚠️ *Suspicious Accounts:* {suspicious_count} \({suspicious_count/total_members_scanned*100:.1f}%\)\n"
+            f"❌ *Fake Accounts:* {fake_count} \({fake_count/total_members_scanned*100:.1f}%\)\n\n"
+            f"💡 *Note:* This analysis scans the first 200 members for quick estimation\. Results are heuristic\."
         )
         
-        await processing_msg.edit_text(report, parse_mode="Markdown")
+        await processing_msg.edit_text(report, parse_mode="MarkdownV2")
             
-    except errors.UserNotParticipant:
-        await processing_msg.edit_text("❌ The bot must be a member of the group/channel to scan it.")
-    except errors.ChatAdminRequired:
-        await processing_msg.edit_text("❌ The bot must be an admin in this chat to see all members.")
+    except errors.UsernameNotOccupied:
+        safe_entity_id = escape_markdown(entity_id, version=2)
+        await processing_msg.edit_text(f"❌ The username `{safe_entity_id}` does not exist.", parse_mode="MarkdownV2")
     except Exception as e:
         logger.error(f"Error scanning members: {e}")
-        await processing_msg.edit_text(f"❌ An error occurred while scanning. Please check the link and the bot's permissions.\n\n`Error: {e}`")
+        await processing_msg.edit_text("❌ An error occurred while scanning. The group may be private, or the link is invalid.")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handler for the /start command."""
     welcome_text = (
-        "👋 **Welcome to DLight - Member Scanner Bot!**\n\n"
-        "I can analyze public Telegram groups and channels to estimate the number of real, fake, and bot accounts.\n\n"
-        "**How to use:**\n"
-        "1. For public groups/channels, just send me the link.\n"
-        "2. For private groups/channels, I must be a member (preferably an admin) to see the users.\n\n"
-        "➡️ Send a link to get started (e.g., `https://t.me/durov`).\n\n"
-        "*Created by Michael A. (Arewa)*"
+        "👋 *Welcome to DLight \- Member Scanner Bot\!*\n\n"
+        "I can analyze public Telegram groups and channels to estimate the number of real, fake, and bot accounts\.\n\n"
+        "*How to use:*\n"
+        "Send me the link to any public group or channel\.\n\n"
+        "➡️ *Example:* `https://t\.me/durov`\n\n"
+        "_Created by Michael A\. \(Arewa\)_"
     )
-    await update.message.reply_text(welcome_text, parse_mode="Markdown")
+    await update.message.reply_text(welcome_text, parse_mode="MarkdownV2")
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Log errors caused by updates."""
@@ -140,45 +155,43 @@ async def main():
     """Start the bot."""
     print("--- DLight Bot Starting ---")
     
-    print("[1/7] Checking environment variables...")
-    if not all([BOT_TOKEN, API_ID, API_HASH]):
-        print("FATAL: Missing one or more environment variables (BOT_TOKEN, API_ID, API_HASH).")
-        logger.error("FATAL: Please check your configuration on Render.")
+    if not all([BOT_TOKEN, API_ID, API_HASH, SESSION_STRING]):
+        print("FATAL: Missing one or more environment variables.")
+        logger.error("FATAL: Missing BOT_TOKEN, API_ID, API_HASH, or PYROGRAM_SESSION. Or API_ID is invalid.")
         return
-    print("[2/7] Environment variables found.")
     
-    global pyro_client
-    print("[3/7] Initializing Pyrogram client...")
-    pyro_client = Client(
+    global user_client
+    user_client = Client(
         name=SESSION_NAME,
         api_id=API_ID,
         api_hash=API_HASH,
-        bot_token=BOT_TOKEN,
-        in_memory=True
+        session_string=SESSION_STRING
     )
     
     try:
-        print("[4/7] Starting Pyrogram client...")
-        await pyro_client.start()
-        print("[5/7] Pyrogram client started successfully.")
-    except Exception as e:
-        print(f"FATAL: Failed to start Pyrogram client. Error: {e}")
-        logger.error(f"FATAL: Failed to start Pyrogram client. Error: {e}")
-        return
+        await user_client.start()
+        
+        application = Application.builder().token(BOT_TOKEN).build()
+        application.add_handler(CommandHandler("start", start))
+        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, scan_members))
+        application.add_error_handler(error_handler)
+        
+        print("🤖 Bot is running...")
+        try:
+            await application.run_polling()
+        finally:
+            # This ensures the user client is stopped when the bot stops.
+            print("Shutting down user client...")
+            await user_client.stop()
 
-    print("[6/7] Building python-telegram-bot application...")
-    application = Application.builder().token(BOT_TOKEN).build()
-    
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, scan_members))
-    application.add_error_handler(error_handler)
-    
-    logger.info("🤖 DLight Bot is now running!")
-    print("[7/7] Starting polling for Telegram updates...")
-    await application.run_polling()
-    
-    print("Polling stopped. Stopping Pyrogram client.")
-    await pyro_client.stop()
+    except Exception as e:
+        print(f"FATAL: A critical error occurred during startup: {e}")
+        logger.error(f"FATAL: Failed to start. Error: {e}")
+        try:
+            if user_client:
+                await user_client.stop()
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     try:
