@@ -17,8 +17,6 @@ logger = logging.getLogger(__name__)
 # --- CONFIGURATION ---
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 API_HASH = os.getenv('API_HASH')
-SESSION_STRING = os.getenv('PYROGRAM_SESSION')
-SESSION_NAME = "dlight_scanner_bot"
 API_ID = None
 # Safely get and convert API_ID to an integer
 try:
@@ -34,10 +32,10 @@ user_client = None
 async def extract_entity_info(link: str):
     """Extract entity username or joinchat id from link"""
     # This regex is improved to handle public channel links like t.me/channelname
-    match = re.search(r"(?:https?://)?(?:www\.)?t\.me/(?:joinchat/|\+)?([\w-]+)", link)
+    match = re.search(r"(?:https?://)?t\.me/(?:joinchat/|\+)?([\w-]+)", link)
     if not match:
         if link.startswith('@'):
-            return link
+            return link[1:]  # Remove the @ symbol
         return None
     return match.group(1)
 
@@ -91,11 +89,30 @@ async def scan_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     try:
         entity = await user_client.get_chat(entity_id)
-        members_iterator = user_client.get_chat_members(entity.id, limit=200) 
+        
+        # Check if we can access members
+        try:
+            # Try to get a small number of members first to test access
+            test_members = []
+            async for member in user_client.get_chat_members(entity.id, limit=5):
+                test_members.append(member)
+                
+            if not test_members:
+                await processing_msg.edit_text("❌ Could not retrieve any members. The bot might not have access.")
+                return
+                
+        except errors.ChatAdminRequired:
+            await processing_msg.edit_text("❌ Bot needs admin permissions to view members.")
+            return
+        except errors.ChannelPrivate:
+            await processing_msg.edit_text("❌ This is a private channel/group. I need to be a member to scan it.")
+            return
+            
+        # Now scan all available members (up to 200)
         real_count = bot_count = suspicious_count = fake_count = 0
         total_members_scanned = 0
 
-        async for member in members_iterator:
+        async for member in user_client.get_chat_members(entity.id, limit=200):
             total_members_scanned += 1
             user_type = await enhanced_analyze_member(member.user)
             if user_type == "real":
@@ -111,7 +128,7 @@ async def scan_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await processing_msg.edit_text("❌ Could not retrieve any members. The bot might not have access, or the chat is empty.")
             return
 
-        member_total = getattr(entity, "members_count", "unknown")
+        member_total = getattr(entity, "members_count", total_members_scanned)
         # Escape the title for MarkdownV2
         safe_title = escape_markdown(entity.title, version=2)
 
@@ -129,11 +146,16 @@ async def scan_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await processing_msg.edit_text(report, parse_mode="MarkdownV2")
             
     except errors.UsernameNotOccupied:
-        safe_entity_id = escape_markdown(entity_id, version=2)
-        await processing_msg.edit_text(f"❌ The username `{safe_entity_id}` does not exist.", parse_mode="MarkdownV2")
+        await processing_msg.edit_text(f"❌ The username `{entity_id}` does not exist.")
+    except errors.ChannelInvalid:
+        await processing_msg.edit_text("❌ Invalid channel/group. Please check the link.")
+    except errors.ChatAdminRequired:
+        await processing_msg.edit_text("❌ Bot needs admin permissions to view members.")
+    except errors.ChannelPrivate:
+        await processing_msg.edit_text("❌ This is a private channel/group. I need to be a member to scan it.")
     except Exception as e:
         logger.error(f"Error scanning members: {e}")
-        await processing_msg.edit_text("❌ An error occurred while scanning. The group may be private, or the link is invalid.")
+        await processing_msg.edit_text("❌ An error occurred while scanning. Please try again later.")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handler for the /start command."""
@@ -147,36 +169,68 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(welcome_text, parse_mode="MarkdownV2")
 
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handler for the /help command."""
+    help_text = (
+        "📖 *DLight Help Guide*\n\n"
+        "*Commands:*\n"
+        "/start \- Start the bot\n"
+        "/help \- Show this help message\n\n"
+        "*Usage:*\n"
+        "1\. Add the bot as admin to your group/channel\n"
+        "2\. Send the group/channel link to the bot\n"
+        "3\. Wait for the analysis to complete\n\n"
+        "*Note:* For large groups, the scan may take several minutes\.\n\n"
+        "⚠️ *Limitations:*\n"
+        "• The bot needs admin permissions\n"
+        "• Analysis is heuristic\-based\n"
+        "• Private groups require bot membership\n\n"
+        "🔧 *Bot by:* @dlight | *Creator:* Michael A\. \(Arewa\)"
+    )
+    await update.message.reply_text(help_text, parse_mode="MarkdownV2")
+
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Log errors caused by updates."""
     logger.error(f"Update {update} caused error {context.error}")
+    if update and update.message:
+        await update.message.reply_text("❌ An error occurred. Please try again later.")
 
 async def main():
     """Start the bot."""
     print("--- DLight Bot Starting ---")
     
-    if not all([BOT_TOKEN, API_ID, API_HASH, SESSION_STRING]):
+    if not all([BOT_TOKEN, API_ID, API_HASH]):
         print("FATAL: Missing one or more environment variables.")
-        logger.error("FATAL: Missing BOT_TOKEN, API_ID, API_HASH, or PYROGRAM_SESSION. Or API_ID is invalid.")
+        logger.error("FATAL: Missing BOT_TOKEN, API_ID, or API_HASH.")
         return
     
     global user_client
+    # Create a user client using bot token (no session string needed)
     user_client = Client(
-        name=SESSION_NAME,
+        name="dlight_scanner",
         api_id=API_ID,
         api_hash=API_HASH,
-        session_string=SESSION_STRING
+        bot_token=BOT_TOKEN,
+        in_memory=True  # No need to save session to file
     )
     
     try:
         await user_client.start()
+        print("✅ User client started successfully")
+        
+        # Check if the client is authorized
+        me = await user_client.get_me()
+        print(f"✅ Logged in as: {me.first_name} (@{me.username})")
         
         application = Application.builder().token(BOT_TOKEN).build()
         application.add_handler(CommandHandler("start", start))
+        application.add_handler(CommandHandler("help", help_command))
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, scan_members))
         application.add_error_handler(error_handler)
         
         print("🤖 Bot is running...")
+        print("🔧 Created by Michael A. (Arewa)")
+        
         try:
             await application.run_polling()
         finally:
@@ -184,18 +238,18 @@ async def main():
             print("Shutting down user client...")
             await user_client.stop()
 
+    except errors.ApiIdInvalid:
+        print("FATAL: API ID is invalid.")
+    except errors.AccessTokenInvalid:
+        print("FATAL: Bot token is invalid.")
     except Exception as e:
         print(f"FATAL: A critical error occurred during startup: {e}")
         logger.error(f"FATAL: Failed to start. Error: {e}")
-        try:
-            if user_client:
-                await user_client.stop()
-        except Exception:
-            pass
+        if user_client and user_client.is_connected:
+            await user_client.stop()
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         logger.info("Bot shutting down.")
-
